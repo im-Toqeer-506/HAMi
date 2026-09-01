@@ -18,6 +18,7 @@ package common
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -29,9 +30,11 @@ const (
 	CardInsufficientMemory            = "CardInsufficientMemory"
 	CardInsufficientCore              = "CardInsufficientCore"
 	CardNotHealth                     = "CardNotHealth"
+	CardCordoned                      = "CardCordoned"
 	NumaNotFit                        = "NumaNotFit"
 	ExclusiveDeviceAllocateConflict   = "ExclusiveDeviceAllocateConflict"
 	CardNotFoundCustomFilterRule      = "CardNotFoundCustomFilterRule"
+	CardMigTopologyInfeasible         = "CardMigTopologyInfeasible"
 	NodeInsufficientDevice            = "NodeInsufficientDevice"
 	AllocatedCardsInsufficientRequest = "AllocatedCardsInsufficientRequest"
 	NodeUnfitPod                      = "NodeUnfitPod"
@@ -45,9 +48,15 @@ func GenReason(reasons map[string]int, cards int) string {
 	for r, cnt := range reasons {
 		reason = append(reason, fmt.Sprintf("%d/%d %s", cnt, cards, r))
 	}
+	sort.Strings(reason)
 	return strings.Join(reason, ", ")
 }
 
+// ParseReason reads a failure reason back as a count per reason type. It reads
+// only the "<count>/<cards> <Reason>" list GenReason writes, so callers that
+// report a rejection must go through GenReason to have it counted. Free-form
+// internal error text reaches the same field and stays unparsed, keeping the
+// device UUIDs and node names it embeds out of event reason keys.
 func ParseReason(reason string) map[string]int {
 	reasons := strings.Split(reason, ", ")
 

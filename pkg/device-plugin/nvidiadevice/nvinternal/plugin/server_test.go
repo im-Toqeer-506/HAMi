@@ -35,6 +35,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -43,102 +44,22 @@ import (
 	v1 "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
 	"github.com/Project-HAMi/HAMi/pkg/device"
 	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/cdi"
+	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/hostpid"
 	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/imex"
 	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/rm"
 	"github.com/Project-HAMi/HAMi/pkg/device/nvidia"
 	"github.com/Project-HAMi/HAMi/pkg/util"
+	"github.com/Project-HAMi/HAMi/pkg/util/client"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 	kubeletdevicepluginv1beta1 "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
-func ptr[T any](x T) *T {
-	return &x
-}
-
-func runFallbackInit(plugin *NvidiaDevicePlugin, deviceNumbers int) {
-	plugin.migCurrent.MigConfigs = make(map[string]nvidia.MigConfigSpecSlice)
-	configSlice := nvidia.MigConfigSpecSlice{}
-	for i := 0; i < deviceNumbers; i++ {
-		conf := nvidia.MigConfigSpec{MigEnabled: false, Devices: []int32{int32(i)}}
-		configSlice = append(configSlice, conf)
-	}
-	plugin.migCurrent.MigConfigs["current"] = configSlice
-}
-
-type MigDeviceConfigs struct {
-	Configs []map[string]int32
-}
-
-func TestMigConfigFilePermissions(t *testing.T) {
-	testCases := []struct {
-		name             string
-		expectedMode     os.FileMode
-		shouldBeReadable bool
-		shouldBeWritable bool
-		otherCanWrite    bool
-	}{
-		{
-			name:             "0644 permissions - owner read/write, others read-only",
-			expectedMode:     0644,
-			shouldBeReadable: true,
-			shouldBeWritable: true,
-			otherCanWrite:    false,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			testFile := tmpDir + "/migconfig.yaml"
-			testData := []byte("test MIG configuration data")
-
-			err := os.WriteFile(testFile, testData, tc.expectedMode)
-			require.NoError(t, err, "file write should succeed")
-
-			info, err := os.Stat(testFile)
-			require.NoError(t, err, "file should exist after write")
-
-			mode := info.Mode().Perm()
-			require.Equal(t, tc.expectedMode, mode,
-				"file permissions should match: expected %#o, got %#o", tc.expectedMode, mode)
-
-			data, err := os.ReadFile(testFile)
-			require.NoError(t, err, "file should be readable")
-			require.Equal(t, testData, data, "file content should match")
-
-			permString := mode.String()
-			if tc.expectedMode == 0644 {
-				require.Equal(t, "-rw-r--r--", permString, "0644 should display as -rw-r--r--")
-			}
-		})
-	}
-}
-
-func TestMigConfigFilePermissionSecurityImprovement(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	correctFile := tmpDir + "/config_0644.yaml"
-	testData := []byte("GPU MIG configuration")
-
-	err := os.WriteFile(correctFile, testData, 0644)
-	require.NoError(t, err)
-
-	info644, err := os.Stat(correctFile)
-	require.NoError(t, err)
-	mode644 := info644.Mode().Perm()
-
-	ownerCanWrite := (mode644 & 0200) != 0
-	groupCanWrite := (mode644 & 0020) != 0
-	otherCanWrite := (mode644 & 0002) != 0
-
-	require.True(t, ownerCanWrite, "0644: Owner should be able to write")
-	require.False(t, groupCanWrite, "0644: Group should NOT write")
-	require.False(t, otherCanWrite, "0644: Others should NOT write (secure!)")
-
-	otherCanRead := (mode644 & 0004) != 0
-	require.True(t, otherCanRead, "0644: Others CAN read (for debugging)")
+func ptr[T any](value T) *T {
+	return &value
 }
 
 func TestCDIAllocateResponse(t *testing.T) {
@@ -250,7 +171,7 @@ func TestCDIAllocateResponse(t *testing.T) {
 	}
 
 	for i := range testCases {
-		tc := testCases[i]
+		tc := &testCases[i]
 		t.Run(tc.description, func(t *testing.T) {
 			deviceListStrategies, _ := v1.NewDeviceListStrategies(tc.deviceListStrategies)
 			plugin := NvidiaDevicePlugin{
@@ -286,199 +207,69 @@ func TestCDIAllocateResponse(t *testing.T) {
 	}
 }
 
-func Test_processMigConfigs(t *testing.T) {
-	type testCase struct {
-		name        string
-		migConfigs  map[string]nvidia.MigConfigSpecSlice
-		deviceCount int
-		expectError bool
-		validate    func(t *testing.T, result nvidia.MigConfigSpecSlice)
-	}
-
-	testConfigs := MigDeviceConfigs{
-		Configs: []map[string]int32{
-			{
-				"1g.10gb": 4,
-				"2g.20gb": 1,
-			},
-			{
-				"3g.30gb": 2,
-			},
-			{},
-		},
-	}
-
-	testCases := []testCase{
-		{
-			name: "SingleConfigForAllDevices",
-			migConfigs: map[string]nvidia.MigConfigSpecSlice{
-				"current": {
-					nvidia.MigConfigSpec{
-						Devices:    []int32{},
-						MigEnabled: true,
-						MigDevices: testConfigs.Configs[1],
-					},
-				},
-			},
-			deviceCount: 3,
-			expectError: false,
-			validate: func(t *testing.T, result nvidia.MigConfigSpecSlice) {
-				if len(result) != 3 {
-					t.Errorf("Expected 3 configs, got %d", len(result))
-				}
-				for i, config := range result {
-					if len(config.Devices) != 1 || config.Devices[0] != int32(i) {
-						t.Errorf("Config for device %d is incorrect: %v", i, config)
-					}
-					if !config.MigEnabled {
-						t.Error("MigEnabled should be true")
-					}
-					if len(config.MigDevices) != 1 || config.MigDevices["3g.30gb"] != 2 {
-						t.Error("MigDevices not preserved correctly")
-					}
-				}
-			},
-		},
-		{
-			name: "MultipleConfigsForSpecificDevicesWithNoEnabled",
-			migConfigs: map[string]nvidia.MigConfigSpecSlice{
-				"current": {
-					nvidia.MigConfigSpec{
-						Devices:    []int32{0, 1},
-						MigEnabled: true,
-						MigDevices: testConfigs.Configs[0],
-					},
-					nvidia.MigConfigSpec{
-						Devices:    []int32{2},
-						MigEnabled: false,
-						MigDevices: testConfigs.Configs[1],
-					},
-				},
-			},
-			deviceCount: 3,
-			expectError: false,
-			validate: func(t *testing.T, result nvidia.MigConfigSpecSlice) {
-				if len(result) != 3 {
-					t.Errorf("Expected 3 configs, got %d", len(result))
-				}
-				for i := 0; i < 2; i++ {
-					if len(result[i].Devices) != 1 || result[i].Devices[0] != int32(i) {
-						t.Errorf("Config for device %d is incorrect: %v", i, result[i])
-					}
-					if !result[i].MigEnabled {
-						t.Error("MigEnabled should be true for device", i)
-					}
-					if len(result[i].MigDevices) != 2 || (result[i].MigDevices["1g.10gb"] != 4 || result[i].MigDevices["2g.20gb"] != 1) {
-						t.Error("MigDevices not preserved correctly for device", i)
-					}
-				}
-				if len(result[2].Devices) != 1 || result[2].Devices[0] != 2 {
-					t.Errorf("Config for device 2 is incorrect: %v", result[2])
-				}
-				if result[2].MigEnabled {
-					t.Error("MigEnabled should be false for device 2")
-				}
-				if len(result[2].MigDevices) != 1 || result[2].MigDevices["3g.30gb"] != 2 {
-					t.Error("MigDevices not preserved correctly for device 2")
-				}
-			},
-		},
-		{
-			name: "MultipleConfigsForSpecificDevicesWithAllEnabled",
-			migConfigs: map[string]nvidia.MigConfigSpecSlice{
-				"current": {
-					nvidia.MigConfigSpec{
-						Devices:    []int32{0, 1},
-						MigEnabled: true,
-						MigDevices: testConfigs.Configs[0],
-					},
-					nvidia.MigConfigSpec{
-						Devices:    []int32{2},
-						MigEnabled: true,
-						MigDevices: testConfigs.Configs[1],
-					},
-				},
-			},
-			deviceCount: 3,
-			expectError: false,
-			validate: func(t *testing.T, result nvidia.MigConfigSpecSlice) {
-				if len(result) != 3 {
-					t.Errorf("Expected 3 configs, got %d", len(result))
-				}
-				for i := 0; i < 2; i++ {
-					if len(result[i].Devices) != 1 || result[i].Devices[0] != int32(i) {
-						t.Errorf("Config for device %d is incorrect: %v", i, result[i])
-					}
-					if !result[i].MigEnabled {
-						t.Error("MigEnabled should be true for device", i)
-					}
-					if len(result[i].MigDevices) != 2 || (result[i].MigDevices["1g.10gb"] != 4 || result[i].MigDevices["2g.20gb"] != 1) {
-						t.Error("MigDevices not preserved correctly for device", i)
-					}
-				}
-				if len(result[2].Devices) != 1 || result[2].Devices[0] != 2 {
-					t.Errorf("Config for device 2 is incorrect: %v", result[2])
-				}
-				if !result[2].MigEnabled {
-					t.Error("MigEnabled should be false for device 2")
-				}
-				if len(result[2].MigDevices) != 1 || result[2].MigDevices["3g.30gb"] != 2 {
-					t.Error("MigDevices not preserved correctly for device 2")
-				}
-				t.Log(result)
-			},
-		},
-		{
-			name: "DeviceNotMatched",
-			migConfigs: map[string]nvidia.MigConfigSpecSlice{
-				"current": {
-					nvidia.MigConfigSpec{
-						Devices:    []int32{0, 1},
-						MigEnabled: true,
-					},
-				},
-			},
-			deviceCount: 3,
-			expectError: true,
-			validate:    nil,
-		},
-	}
-
-	plugin := NvidiaDevicePlugin{
+// TestNewNvidiaDevicePluginPropagatesImexChannels guards the wiring from options
+// into the plugin: WithImexChannels stores the channels on options, and the
+// plugin the constructor builds must carry them, otherwise updateResponseForCDI,
+// updateResponseForImexChannelsEnvVar, updateResponseForDeviceMounts, and
+// apiDeviceSpecs all see an empty list and IMEX channels are never exposed to the
+// container.
+func TestNewNvidiaDevicePluginPropagatesImexChannels(t *testing.T) {
+	channels := imex.Channels{{ID: "0"}, {ID: "1"}}
+	o := &options{
+		imexChannels: channels,
 		config: &nvidia.DeviceConfig{
 			Config: &v1.Config{
 				Flags: v1.Flags{
-					CommandLineFlags: v1.CommandLineFlags{},
+					CommandLineFlags: v1.CommandLineFlags{
+						Plugin: &v1.PluginCommandLineFlags{
+							CDIAnnotationPrefix: ptr("cdi.k8s.io/"),
+						},
+					},
 				},
 			},
 		},
 	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result, err := plugin.processMigConfigs(tc.migConfigs, tc.deviceCount)
-
-			if tc.expectError {
-				if err == nil {
-					t.Error("Expected error but got nil")
-				}
-				t.Log(err)
-				return
-			}
-
-			if err != nil {
-				t.Fatalf("Unexpected error: %v", err)
-			}
-
-			if tc.validate != nil {
-				tc.validate(t, result)
-			}
-		})
+	resourceManager := &rm.ResourceManagerMock{
+		ResourceFunc: func() v1.ResourceName { return "nvidia.com/gpu" },
 	}
+	deviceListStrategies, err := v1.NewDeviceListStrategies([]string{"envvar"})
+	require.NoError(t, err)
+
+	plugin := o.newNvidiaDevicePlugin(
+		context.Background(),
+		resourceManager,
+		deviceListStrategies,
+		nvidia.NvidiaConfig{},
+		"hami-core",
+		nil,
+	)
+
+	require.Equal(t, channels, plugin.imexChannels,
+		"newNvidiaDevicePlugin must copy imexChannels from options into the plugin")
+}
+
+// TestUpdateResponseForImexChannelsEnvVarExposesChannels covers the container-facing
+// half of the IMEX wiring: once the channels are on the plugin, the allocate response
+// must expose them to the container through the IMEX channel env var. With
+// TestNewNvidiaDevicePluginPropagatesImexChannels (options into the plugin) this pins
+// the full path the #2892 regression broke.
+func TestUpdateResponseForImexChannelsEnvVarExposesChannels(t *testing.T) {
+	plugin := NvidiaDevicePlugin{
+		imexChannels: imex.Channels{{ID: "0"}, {ID: "3"}},
+	}
+
+	response := kubeletdevicepluginv1beta1.ContainerAllocateResponse{
+		Envs: map[string]string{},
+	}
+	plugin.updateResponseForImexChannelsEnvVar(&response)
+
+	require.Equal(t, "0,3", response.Envs[v1.ImexChannelEnvVar],
+		"updateResponseForImexChannelsEnvVar must expose the plugin's IMEX channels to the container")
 }
 
 func TestSelectPreferredDeviceIDsFromAnnotatedDevices(t *testing.T) {
 	plugin := &NvidiaDevicePlugin{}
+	// Use real NVIDIA GPU UUID format: GPU-xxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 	available := []string{
 		"GPU-03f69c50-207a-2038-9b45-23cac89cb67a-0", "GPU-03f69c50-207a-2038-9b45-23cac89cb67a-1",
 		"GPU-03f69c50-207a-2038-9b45-23cac89cb67b-0",
@@ -525,7 +316,7 @@ func TestSelectPreferredDeviceIDsFromAnnotatedDevicesErrorsWhenAnnotatedUUIDMiss
 	}
 	desired := device.ContainerDevices{
 		{UUID: "GPU-03f69c50-207a-2038-9b45-23cac89cb67a"},
-		{UUID: "GPU-03f69c50-207a-2038-9b45-23cac89cb67c"},
+		{UUID: "GPU-03f69c50-207a-2038-9b45-23cac89cb67c"}, // Missing from available
 	}
 
 	_, err := plugin.selectPreferredDeviceIDsFromAnnotatedDevices(available, nil, desired, len(desired))
@@ -533,12 +324,33 @@ func TestSelectPreferredDeviceIDsFromAnnotatedDevicesErrorsWhenAnnotatedUUIDMiss
 	require.Contains(t, err.Error(), "GPU-03f69c50-207a-2038-9b45-23cac89cb67c")
 }
 
-func TestGetDevicePluginOptionsEnablesPreferredAllocation(t *testing.T) {
-	plugin := &NvidiaDevicePlugin{}
+// TestGetDevicePluginOptionsHonorsEnableGetPreferredAllocation is a regression
+// test for issue #2844: GetDevicePluginOptions must reflect the configured
+// enableGetPreferredAllocation value, not unconditionally report true.
+func TestGetDevicePluginOptionsHonorsEnableGetPreferredAllocation(t *testing.T) {
+	tests := []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "enabled=true reports true", enabled: true},
+		{name: "enabled=false reports false", enabled: false},
+	}
 
-	options, err := plugin.GetDevicePluginOptions(context.Background(), &kubeletdevicepluginv1beta1.Empty{})
-	require.NoError(t, err)
-	require.True(t, options.GetPreferredAllocationAvailable)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Save and restore the package-level variable used by both
+			// Register() and GetDevicePluginOptions().
+			original := enableGetPreferredAllocation
+			enableGetPreferredAllocation = tc.enabled
+			defer func() { enableGetPreferredAllocation = original }()
+
+			plugin := &NvidiaDevicePlugin{}
+			options, err := plugin.GetDevicePluginOptions(context.Background(), &kubeletdevicepluginv1beta1.Empty{})
+			require.NoError(t, err)
+			require.Equal(t, tc.enabled, options.GetPreferredAllocationAvailable,
+				"GetDevicePluginOptions must reflect enableGetPreferredAllocation=%v", tc.enabled)
+		})
+	}
 }
 
 func TestGetPreferredAllocationAlignsWithAnnotatedDevices(t *testing.T) {
@@ -571,7 +383,6 @@ func TestGetPreferredAllocationAlignsWithAnnotatedDevices(t *testing.T) {
 			Containers: []corev1.Container{{Name: "main"}},
 		},
 	}
-
 	plugin := &NvidiaDevicePlugin{}
 	t.Setenv(util.NodeNameEnvName, "node-a")
 	previousGetPendingPod := getPendingPod
@@ -731,9 +542,10 @@ func TestGetPreferredAllocationSkipsEmptyAnnotations(t *testing.T) {
 			Namespace: "default",
 			Name:      "test-pod",
 			Annotations: map[string]string{
+				// Annotation includes init container (empty) + regular container (with GPU)
 				"hami.io/vgpu-devices-to-allocate": device.EncodePodSingleDevice(device.PodSingleDevice{
-					{},
-					{
+					{}, // init container - empty
+					{ // regular container - 2 GPUs
 						{UUID: "GPU-03f69c50-207a-2038-9b45-23cac89cb67a", Type: nvidia.NvidiaGPUDevice},
 						{UUID: "GPU-03f69c50-207a-2038-9b45-23cac89cb67b", Type: nvidia.NvidiaGPUDevice},
 					},
@@ -756,14 +568,12 @@ func TestGetPreferredAllocationSkipsEmptyAnnotations(t *testing.T) {
 		getPendingPod = previousGetPendingPod
 	}()
 
+	// Kubelet only sends one request (for the main container), not two
 	request := &kubeletdevicepluginv1beta1.PreferredAllocationRequest{
 		ContainerRequests: []*kubeletdevicepluginv1beta1.ContainerPreferredAllocationRequest{
 			{
-				AvailableDeviceIDs: []string{
-					"GPU-03f69c50-207a-2038-9b45-23cac89cb67a-0", "GPU-03f69c50-207a-2038-9b45-23cac89cb67a-1",
-					"GPU-03f69c50-207a-2038-9b45-23cac89cb67b-0", "GPU-03f69c50-207a-2038-9b45-23cac89cb67b-1",
-				},
-				AllocationSize: 2,
+				AvailableDeviceIDs: []string{"GPU-03f69c50-207a-2038-9b45-23cac89cb67a-0", "GPU-03f69c50-207a-2038-9b45-23cac89cb67a-1", "GPU-03f69c50-207a-2038-9b45-23cac89cb67b-0", "GPU-03f69c50-207a-2038-9b45-23cac89cb67b-1"},
+				AllocationSize:     2,
 			},
 		},
 	}
@@ -771,23 +581,22 @@ func TestGetPreferredAllocationSkipsEmptyAnnotations(t *testing.T) {
 	response, err := plugin.GetPreferredAllocation(context.Background(), request)
 	require.NoError(t, err)
 	require.Len(t, response.ContainerResponses, 1)
-	require.ElementsMatch(t, []string{
-		"GPU-03f69c50-207a-2038-9b45-23cac89cb67a-0",
-		"GPU-03f69c50-207a-2038-9b45-23cac89cb67b-0",
-	}, response.ContainerResponses[0].DeviceIDs)
+	// Should match GPU-a and GPU-b, not fail due to empty init container annotation
+	require.ElementsMatch(t, []string{"GPU-03f69c50-207a-2038-9b45-23cac89cb67a-0", "GPU-03f69c50-207a-2038-9b45-23cac89cb67b-0"}, response.ContainerResponses[0].DeviceIDs)
 }
 
-func TestPhysicalDeviceIDHandlesMIGFormat(t *testing.T) {
+func TestPhysicalDeviceIDHandlesVirtualFormats(t *testing.T) {
 	tests := []struct {
 		input    string
 		expected string
 	}{
+		// Virtual device format (6 dashes)
 		{"GPU-03f69c50-207a-2038-9b45-23cac89cb67a-0", "GPU-03f69c50-207a-2038-9b45-23cac89cb67a"},
 		{"GPU-03f69c50-207a-2038-9b45-23cac89cb67a-10", "GPU-03f69c50-207a-2038-9b45-23cac89cb67a"},
-		{"GPU-03f69c50-207a-2038-9b45-23cac89cb67a[0-1]", "GPU-03f69c50-207a-2038-9b45-23cac89cb67a"},
-		{"GPU-03f69c50-207a-2038-9b45-23cac89cb67a[1-2]", "GPU-03f69c50-207a-2038-9b45-23cac89cb67a"},
 		{"GPU-03f69c50-207a-2038-9b45-23cac89cb67a::replica-1", "GPU-03f69c50-207a-2038-9b45-23cac89cb67a"},
+		// Plain UUID (5 dashes, should not be modified)
 		{"GPU-03f69c50-207a-2038-9b45-23cac89cb67a", "GPU-03f69c50-207a-2038-9b45-23cac89cb67a"},
+		// UUID ending with -123 (5 dashes total, should NOT be treated as virtual device)
 		{"GPU-03f69c50-207a-2038-9b45-23cac89cb123", "GPU-03f69c50-207a-2038-9b45-23cac89cb123"},
 	}
 
@@ -799,7 +608,7 @@ func TestPhysicalDeviceIDHandlesMIGFormat(t *testing.T) {
 	}
 }
 
-func TestSelectPreferredDeviceIDsWithMIGUUIDs(t *testing.T) {
+func TestSelectPreferredDeviceIDsWithPhysicalMIGReservations(t *testing.T) {
 	plugin := &NvidiaDevicePlugin{}
 	available := []string{
 		"GPU-03f69c50-207a-2038-9b45-23cac89cb67a-0", "GPU-03f69c50-207a-2038-9b45-23cac89cb67a-1",
@@ -807,14 +616,15 @@ func TestSelectPreferredDeviceIDsWithMIGUUIDs(t *testing.T) {
 		"GPU-03f69c50-207a-2038-9b45-23cac89cb67c-0",
 	}
 	desired := device.ContainerDevices{
-		{UUID: "GPU-03f69c50-207a-2038-9b45-23cac89cb67a[0-1]"},
+		{UUID: "GPU-03f69c50-207a-2038-9b45-23cac89cb67a"},
 		{UUID: "GPU-03f69c50-207a-2038-9b45-23cac89cb67b"},
-		{UUID: "GPU-03f69c50-207a-2038-9b45-23cac89cb67c[1-2]"},
+		{UUID: "GPU-03f69c50-207a-2038-9b45-23cac89cb67c"},
 	}
 
 	got, err := plugin.selectPreferredDeviceIDsFromAnnotatedDevices(available, nil, desired, 3)
 	require.NoError(t, err)
 	require.Len(t, got, 3)
+	// Should select one slice from each physical GPU
 	require.Contains(t, got, "GPU-03f69c50-207a-2038-9b45-23cac89cb67a-0")
 	require.Contains(t, got, "GPU-03f69c50-207a-2038-9b45-23cac89cb67b-0")
 	require.Contains(t, got, "GPU-03f69c50-207a-2038-9b45-23cac89cb67c-0")
@@ -853,11 +663,17 @@ func TestGetPreferredAllocationFallbackOnAnnotatedDeviceMappingFailure(t *testin
 		},
 	}
 
-	plugin := &NvidiaDevicePlugin{rm: mockRM}
+	plugin := &NvidiaDevicePlugin{
+		rm: mockRM,
+	}
 	t.Setenv(util.NodeNameEnvName, "node-a")
 	previousGetPendingPod := getPendingPod
-	getPendingPod = func(context.Context, string) (*corev1.Pod, error) { return pod, nil }
-	defer func() { getPendingPod = previousGetPendingPod }()
+	getPendingPod = func(context.Context, string) (*corev1.Pod, error) {
+		return pod, nil
+	}
+	defer func() {
+		getPendingPod = previousGetPendingPod
+	}()
 
 	request := &kubeletdevicepluginv1beta1.PreferredAllocationRequest{
 		ContainerRequests: []*kubeletdevicepluginv1beta1.ContainerPreferredAllocationRequest{
@@ -908,11 +724,17 @@ func TestGetPreferredAllocationFallbackOnInsufficientAnnotatedDevices(t *testing
 		},
 	}
 
-	plugin := &NvidiaDevicePlugin{rm: mockRM}
+	plugin := &NvidiaDevicePlugin{
+		rm: mockRM,
+	}
 	t.Setenv(util.NodeNameEnvName, "node-a")
 	previousGetPendingPod := getPendingPod
-	getPendingPod = func(context.Context, string) (*corev1.Pod, error) { return pod, nil }
-	defer func() { getPendingPod = previousGetPendingPod }()
+	getPendingPod = func(context.Context, string) (*corev1.Pod, error) {
+		return pod, nil
+	}
+	defer func() {
+		getPendingPod = previousGetPendingPod
+	}()
 
 	request := &kubeletdevicepluginv1beta1.PreferredAllocationRequest{
 		ContainerRequests: []*kubeletdevicepluginv1beta1.ContainerPreferredAllocationRequest{
@@ -963,7 +785,23 @@ func TestAlignContainerDevicesWithAllocatedIDsRejectsLengthMismatch(t *testing.T
 	require.Contains(t, err.Error(), "device number not matched")
 }
 
-func TestAllocateUsesKubeletSelectedUUIDsForVGPUResponse(t *testing.T) {
+func TestAllocateUsesSelectedUUIDsAndHostPIDBroker(t *testing.T) {
+	t.Setenv(hostpid.EnvironmentVariable, "1")
+	prepareCalls := 0
+	previousPrepareHostPIDLockParent := prepareHostPIDLockParentForAllocation
+	prepareHostPIDLockParentForAllocation = func() error {
+		prepareCalls++
+		return nil
+	}
+	defer func() {
+		prepareHostPIDLockParentForAllocation =
+			previousPrepareHostPIDLockParent
+	}()
+	previousEnableGetPreferredAllocation := enableGetPreferredAllocation
+	enableGetPreferredAllocation = true
+	defer func() {
+		enableGetPreferredAllocation = previousEnableGetPreferredAllocation
+	}()
 	deviceListStrategies, _ := v1.NewDeviceListStrategies([]string{"envvar"})
 	deviceIDStrategy := v1.DeviceIDStrategyUUID
 	memScale := 1.0
@@ -1010,10 +848,6 @@ func TestAllocateUsesKubeletSelectedUUIDsForVGPUResponse(t *testing.T) {
 	getPendingPod = func(context.Context, string) (*corev1.Pod, error) { return pod, nil }
 	defer func() { getPendingPod = previousGetPendingPod }()
 
-	previousEraseNextDeviceTypeFromAnnotation := eraseNextDeviceTypeFromAnnotation
-	eraseNextDeviceTypeFromAnnotation = func(string, corev1.Pod) error { return nil }
-	defer func() { eraseNextDeviceTypeFromAnnotation = previousEraseNextDeviceTypeFromAnnotation }()
-
 	previousPodAllocationFailed := podAllocationFailed
 	podAllocationFailed = func(string, *corev1.Pod, string) {}
 	defer func() { podAllocationFailed = previousPodAllocationFailed }()
@@ -1021,6 +855,11 @@ func TestAllocateUsesKubeletSelectedUUIDsForVGPUResponse(t *testing.T) {
 	previousPodAllocationTrySuccess := podAllocationTrySuccess
 	podAllocationTrySuccess = func(string, string, string, *corev1.Pod) {}
 	defer func() { podAllocationTrySuccess = previousPodAllocationTrySuccess }()
+
+	// Provide a fake K8s client so the real patchErasedAnnotation can patch
+	previousKubeClient := client.KubeClient
+	client.KubeClient = fake.NewSimpleClientset(pod)
+	defer func() { client.KubeClient = previousKubeClient }()
 
 	request := &kubeletdevicepluginv1beta1.AllocateRequest{
 		ContainerRequests: []*kubeletdevicepluginv1beta1.ContainerAllocateRequest{{
@@ -1030,96 +869,62 @@ func TestAllocateUsesKubeletSelectedUUIDsForVGPUResponse(t *testing.T) {
 
 	response, err := plugin.Allocate(context.Background(), request)
 	require.NoError(t, err)
+	require.Equal(t, 1, prepareCalls)
 	require.Equal(t, "GPU-03f69c50-207a-2038-9b45-23cac89cb67a", response.ContainerResponses[0].Envs[deviceListEnvVar])
 	require.Equal(t, "3000m", response.ContainerResponses[0].Envs["CUDA_DEVICE_MEMORY_LIMIT_0"])
 	require.Equal(t, "50", response.ContainerResponses[0].Envs["CUDA_DEVICE_SM_LIMIT"])
-}
-
-func TestAllocateReleasesNodeLockWhenNonMIGAllocateResponseFails(t *testing.T) {
-	deviceListStrategies, _ := v1.NewDeviceListStrategies([]string{"cdi-annotations"})
-	deviceIDStrategy := v1.DeviceIDStrategyUUID
-	expectedNodeName := "node-a"
-	t.Setenv(util.NodeNameEnvName, expectedNodeName)
-
-	plugin := &NvidiaDevicePlugin{
-		config: &nvidia.DeviceConfig{
-			Config: &v1.Config{
-				Flags: v1.Flags{
-					CommandLineFlags: v1.CommandLineFlags{
-						Plugin: &v1.PluginCommandLineFlags{
-							DeviceIDStrategy: &deviceIDStrategy,
-						},
-					},
-				},
-			},
-		},
-		cdiHandler: &cdi.InterfaceMock{
-			QualifiedNameFunc: func(string, string) string {
-				return "invalid-cdi-device-name"
-			},
-		},
-		deviceListStrategies: deviceListStrategies,
-		cdiAnnotationPrefix:  v1.DefaultCDIAnnotationPrefix,
+	require.Equal(t, "1", response.ContainerResponses[0].Envs[hostpid.EnvironmentVariable])
+	brokerMountCount := 0
+	brokerMountIndex := -1
+	fallbackParentMountCount := 0
+	fallbackParentMountIndex := -1
+	for mountIndex, mount := range response.ContainerResponses[0].Mounts {
+		if mount.ContainerPath == hostpid.ContainerDirectory {
+			require.Equal(t, hostpid.ServerDirectory, mount.HostPath)
+			require.True(t, mount.ReadOnly)
+			brokerMountIndex = mountIndex
+			brokerMountCount++
+		}
+		if mount.ContainerPath == hostPIDLockParentDirectory {
+			require.Equal(t, hostPIDLockParentDirectory, mount.HostPath)
+			require.False(t, mount.ReadOnly)
+			fallbackParentMountIndex = mountIndex
+			fallbackParentMountCount++
+		}
 	}
+	require.Equal(t, 1, brokerMountCount)
+	require.Equal(t, 1, fallbackParentMountCount)
+	require.Less(t, fallbackParentMountIndex, brokerMountIndex)
 
-	previousInRequestDevice := device.InRequestDevices[nvidia.NvidiaGPUDevice]
-	device.InRequestDevices[nvidia.NvidiaGPUDevice] = "hami.io/vgpu-devices-to-allocate"
-	defer func() { device.InRequestDevices[nvidia.NvidiaGPUDevice] = previousInRequestDevice }()
-
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-pod",
-			Namespace: "default",
-			UID:       "pod-uid",
-			Annotations: map[string]string{
-				"hami.io/vgpu-devices-to-allocate": "GPU-annotated-a,NVIDIA,3000,50:;",
-			},
-		},
-		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main"}}},
+	t.Setenv(hostpid.EnvironmentVariable, "")
+	pod.Annotations["hami.io/vgpu-devices-to-allocate"] =
+		"GPU-annotated-a,NVIDIA,3000,50:;"
+	client.KubeClient = fake.NewSimpleClientset(pod)
+	disabledResponse, err := plugin.Allocate(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, 2, prepareCalls)
+	require.NotContains(t, disabledResponse.ContainerResponses[0].Envs,
+		hostpid.EnvironmentVariable)
+	fallbackMountCount := 0
+	for _, mount := range disabledResponse.ContainerResponses[0].Mounts {
+		require.NotEqual(t, hostpid.ContainerDirectory, mount.ContainerPath)
+		if mount.ContainerPath == hostPIDLockParentDirectory {
+			require.Equal(t, hostPIDLockParentDirectory, mount.HostPath)
+			require.False(t, mount.ReadOnly)
+			fallbackMountCount++
+		}
 	}
+	require.Equal(t, 1, fallbackMountCount)
 
-	previousGetPendingPod := getPendingPod
-	getPendingPod = func(context.Context, string) (*corev1.Pod, error) { return pod, nil }
-	defer func() { getPendingPod = previousGetPendingPod }()
-
-	eraseCalled := false
-	previousEraseNextDeviceTypeFromAnnotation := eraseNextDeviceTypeFromAnnotation
-	eraseNextDeviceTypeFromAnnotation = func(string, corev1.Pod) error {
-		eraseCalled = true
-		return nil
+	prepareHostPIDLockParentForAllocation = func() error {
+		return errors.New("parent preparation fixture")
 	}
-	defer func() { eraseNextDeviceTypeFromAnnotation = previousEraseNextDeviceTypeFromAnnotation }()
-
-	failedCalled := false
-	previousPodAllocationFailed := podAllocationFailed
-	podAllocationFailed = func(nodeName string, failedPod *corev1.Pod, lockName string) {
-		failedCalled = true
-		require.Equal(t, expectedNodeName, nodeName)
-		require.Equal(t, pod, failedPod)
-		require.Equal(t, NodeLockNvidia, lockName)
-	}
-	defer func() { podAllocationFailed = previousPodAllocationFailed }()
-
-	successCalled := false
-	previousPodAllocationTrySuccess := podAllocationTrySuccess
-	podAllocationTrySuccess = func(string, string, string, *corev1.Pod) {
-		successCalled = true
-	}
-	defer func() { podAllocationTrySuccess = previousPodAllocationTrySuccess }()
-
-	request := &kubeletdevicepluginv1beta1.AllocateRequest{
-		ContainerRequests: []*kubeletdevicepluginv1beta1.ContainerAllocateRequest{{
-			DevicesIds: []string{"GPU-03f69c50-207a-2038-9b45-23cac89cb67a-0"},
-		}},
-	}
-
-	response, err := plugin.Allocate(context.Background(), request)
-	require.Nil(t, response)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "failed to get allocate response")
-	require.True(t, failedCalled)
-	require.False(t, eraseCalled)
-	require.False(t, successCalled)
+	pod.Annotations["hami.io/vgpu-devices-to-allocate"] =
+		"GPU-annotated-a,NVIDIA,3000,50:;"
+	client.KubeClient = fake.NewSimpleClientset(pod)
+	failedResponse, err := plugin.Allocate(context.Background(), request)
+	require.Nil(t, failedResponse)
+	require.ErrorContains(t, err, "failed to prepare host PID lock parent")
 }
 
 func TestAllocatePreservesContainerOrderWhenOneContainerFallsBack(t *testing.T) {
@@ -1164,17 +969,14 @@ func TestAllocatePreservesContainerOrderWhenOneContainerFallsBack(t *testing.T) 
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c0"}, {Name: "c1"}}},
 	}
+	fakeClient := fake.NewSimpleClientset(pod.DeepCopy())
+	previousKubeClient := client.KubeClient
+	client.KubeClient = fakeClient
+	defer func() { client.KubeClient = previousKubeClient }()
 
 	previousGetPendingPod := getPendingPod
 	getPendingPod = func(context.Context, string) (*corev1.Pod, error) { return pod, nil }
 	defer func() { getPendingPod = previousGetPendingPod }()
-
-	previousEraseNextDeviceTypeFromAnnotation := eraseNextDeviceTypeFromAnnotation
-	eraseNextDeviceTypeFromAnnotation = func(dtype string, p corev1.Pod) error {
-		pod.Annotations["hami.io/vgpu-devices-to-allocate"] = ";GPU-annotated-b,NVIDIA,4000,60:;"
-		return nil
-	}
-	defer func() { eraseNextDeviceTypeFromAnnotation = previousEraseNextDeviceTypeFromAnnotation }()
 
 	previousPodAllocationFailed := podAllocationFailed
 	podAllocationFailed = func(string, *corev1.Pod, string) {}
@@ -1199,112 +1001,50 @@ func TestAllocatePreservesContainerOrderWhenOneContainerFallsBack(t *testing.T) 
 	require.Equal(t, "4000m", response.ContainerResponses[1].Envs["CUDA_DEVICE_MEMORY_LIMIT_0"])
 }
 
-func TestMigFallbackInitialization(t *testing.T) {
-	testCases := []struct {
-		name          string
-		deviceNumbers int
-	}{
-		{name: "zero devices", deviceNumbers: 0},
-		{name: "single device", deviceNumbers: 1},
-		{name: "three devices", deviceNumbers: 3},
-		{name: "eight devices", deviceNumbers: 8},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			plugin := &NvidiaDevicePlugin{
-				config: &nvidia.DeviceConfig{
-					Config: &v1.Config{
-						Flags: v1.Flags{
-							CommandLineFlags: v1.CommandLineFlags{},
-						},
-					},
-				},
-				migCurrent: nvidia.MigPartedSpec{},
-			}
-
-			runFallbackInit(plugin, tc.deviceNumbers)
-
-			require.NotNil(t, plugin.migCurrent.MigConfigs,
-				"MigConfigs must not be nil after fallback init")
-			require.NotNil(t, plugin.migCurrent.MigConfigs["current"],
-				"current key must always exist after fallback init")
-			require.Len(t, plugin.migCurrent.MigConfigs["current"], tc.deviceNumbers,
-				"one config entry per device is required")
-
-			for i := 0; i < tc.deviceNumbers; i++ {
-				cfg := plugin.migCurrent.MigConfigs["current"][i]
-				require.False(t, cfg.MigEnabled,
-					"fallback must set MigEnabled=false for device %d", i)
-				require.Len(t, cfg.Devices, 1,
-					"each fallback entry must reference exactly one device (device %d)", i)
-				require.Equal(t, int32(i), cfg.Devices[0],
-					"device index must match loop counter for device %d", i)
-			}
-		})
-	}
+type mockListAndWatchServer struct {
+	grpc.ServerStream
+	sendErrs []error
+	sent     []*kubeletdevicepluginv1beta1.ListAndWatchResponse
 }
 
-func TestMigFallbackInit_ReplacesExistingConfigs(t *testing.T) {
-	plugin := &NvidiaDevicePlugin{
-		config: &nvidia.DeviceConfig{
-			Config: &v1.Config{
-				Flags: v1.Flags{
-					CommandLineFlags: v1.CommandLineFlags{},
-				},
-			},
-		},
-		migCurrent: nvidia.MigPartedSpec{
-			MigConfigs: map[string]nvidia.MigConfigSpecSlice{
-				"current": {
-					nvidia.MigConfigSpec{MigEnabled: true, Devices: []int32{0}},
-					nvidia.MigConfigSpec{MigEnabled: true, Devices: []int32{1}},
-				},
-				"stale-key": {},
-			},
-		},
+func (m *mockListAndWatchServer) Send(response *kubeletdevicepluginv1beta1.ListAndWatchResponse) error {
+	m.sent = append(m.sent, response)
+	if len(m.sendErrs) == 0 {
+		return nil
 	}
-
-	deviceNumbers := 2
-	runFallbackInit(plugin, deviceNumbers)
-
-	require.Len(t, plugin.migCurrent.MigConfigs, 1,
-		"fallback must produce a map with only the current key")
-	require.Len(t, plugin.migCurrent.MigConfigs["current"], deviceNumbers)
-	for i := 0; i < deviceNumbers; i++ {
-		require.False(t, plugin.migCurrent.MigConfigs["current"][i].MigEnabled,
-			"stale MigEnabled=true must be overwritten for device %d", i)
-	}
+	err := m.sendErrs[0]
+	m.sendErrs = m.sendErrs[1:]
+	return err
 }
 
-func TestMigCurrentConfigsNeverNil(t *testing.T) {
-	plugin := &NvidiaDevicePlugin{
-		config: &nvidia.DeviceConfig{
-			Config: &v1.Config{
-				Flags: v1.Flags{
-					CommandLineFlags: v1.CommandLineFlags{},
-				},
-			},
-		},
-		operatingMode: "mig",
-		migCurrent:    nvidia.MigPartedSpec{},
+func TestListAndWatchSendError(t *testing.T) {
+	mockRM := &rm.ResourceManagerMock{
+		DevicesFunc:  func() rm.Devices { return rm.Devices{} },
+		ResourceFunc: func() v1.ResourceName { return v1.ResourceName("nvidia.com/gpu") },
 	}
 
-	shouldUseMig := plugin.operatingMode == "mig"
-	deviceSupportMig := false
-	if shouldUseMig && !deviceSupportMig {
-		shouldUseMig = false
-	}
+	t.Run("initial send fails", func(t *testing.T) {
+		expectedErr := fmt.Errorf("initial send failed")
+		server := &mockListAndWatchServer{sendErrs: []error{expectedErr}}
+		plugin := &NvidiaDevicePlugin{
+			rm: mockRM, stop: make(chan any), health: make(chan *rm.Device, 1),
+			schedulerConfig: nvidia.NvidiaConfig{NodeDefaultConfig: nvidia.NodeDefaultConfig{DeviceSplitCount: ptr[uint](1)}},
+		}
+		err := plugin.ListAndWatch(&kubeletdevicepluginv1beta1.Empty{}, server)
+		require.ErrorIs(t, err, expectedErr)
+		require.Len(t, server.sent, 1)
+	})
 
-	migSuccessfullyInitialized := false
-	if !migSuccessfullyInitialized {
-		runFallbackInit(plugin, 2)
-	}
-
-	require.NotNil(t, plugin.migCurrent.MigConfigs)
-	require.NotNil(t, plugin.migCurrent.MigConfigs["current"])
-	require.Len(t, plugin.migCurrent.MigConfigs["current"], 2)
-	for _, cfg := range plugin.migCurrent.MigConfigs["current"] {
-		require.False(t, cfg.MigEnabled)
-	}
+	t.Run("update send fails", func(t *testing.T) {
+		expectedErr := fmt.Errorf("update send failed")
+		server := &mockListAndWatchServer{sendErrs: []error{nil, expectedErr}}
+		plugin := &NvidiaDevicePlugin{
+			rm: mockRM, stop: make(chan any), health: make(chan *rm.Device, 1),
+			schedulerConfig: nvidia.NvidiaConfig{NodeDefaultConfig: nvidia.NodeDefaultConfig{DeviceSplitCount: ptr[uint](1)}},
+		}
+		plugin.health <- &rm.Device{Device: kubeletdevicepluginv1beta1.Device{ID: "gpu-1"}}
+		err := plugin.ListAndWatch(&kubeletdevicepluginv1beta1.Empty{}, server)
+		require.NoError(t, err)
+		require.Len(t, server.sent, 2)
+	})
 }

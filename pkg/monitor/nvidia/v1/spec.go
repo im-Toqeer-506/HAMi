@@ -16,7 +16,10 @@ limitations under the License.
 
 package v1
 
-import "unsafe"
+import (
+	"sync/atomic"
+	"unsafe"
+)
 
 const maxDevices = 16
 
@@ -92,7 +95,7 @@ func (s Spec) DeviceMax() int {
 }
 
 func (s Spec) DeviceNum() int {
-	return int(s.sr.num)
+	return int(min(s.sr.num, uint64(maxDevices)))
 }
 
 // activeProcs returns the process slots currently in use. procnum is read from
@@ -106,6 +109,9 @@ func (s Spec) activeProcs() []shrregProcSlotT {
 func (s Spec) DeviceMemoryContextSize(idx int) uint64 {
 	v := uint64(0)
 	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.used[idx].contextSize
 	}
 	return v
@@ -114,6 +120,9 @@ func (s Spec) DeviceMemoryContextSize(idx int) uint64 {
 func (s Spec) DeviceMemoryModuleSize(idx int) uint64 {
 	v := uint64(0)
 	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.used[idx].moduleSize
 	}
 	return v
@@ -122,6 +131,9 @@ func (s Spec) DeviceMemoryModuleSize(idx int) uint64 {
 func (s Spec) DeviceMemoryBufferSize(idx int) uint64 {
 	v := uint64(0)
 	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.used[idx].bufferSize
 	}
 	return v
@@ -130,6 +142,9 @@ func (s Spec) DeviceMemoryBufferSize(idx int) uint64 {
 func (s Spec) DeviceMemoryOffset(idx int) uint64 {
 	v := uint64(0)
 	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.used[idx].offset
 	}
 	return v
@@ -138,6 +153,9 @@ func (s Spec) DeviceMemoryOffset(idx int) uint64 {
 func (s Spec) DeviceMemoryTotal(idx int) uint64 {
 	v := uint64(0)
 	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.used[idx].total
 	}
 	return v
@@ -146,16 +164,18 @@ func (s Spec) DeviceMemoryTotal(idx int) uint64 {
 func (s Spec) DeviceSmUtil(idx int) uint64 {
 	v := uint64(0)
 	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.deviceUtil[idx].smUtil
 	}
 	return v
 }
 
 func (s Spec) SetDeviceSmLimit(l uint64) {
-	idx := uint64(0)
-	for idx < s.sr.num {
-		s.sr.smLimit[idx] = l
-		idx += 1
+	n := min(s.sr.num, maxDevices)
+	for idx := range n {
+		atomic.StoreUint64(&s.sr.smLimit[idx], l)
 	}
 }
 
@@ -168,19 +188,18 @@ func (s Spec) DeviceUUID(idx int) string {
 }
 
 func (s Spec) DeviceMemoryLimit(idx int) uint64 {
-	return s.sr.limit[idx]
+	return atomic.LoadUint64(&s.sr.limit[idx])
 }
 
 func (s Spec) SetDeviceMemoryLimit(l uint64) {
-	idx := uint64(0)
-	for idx < s.sr.num {
-		s.sr.limit[idx] = l
-		idx += 1
+	n := min(s.sr.num, maxDevices)
+	for idx := range n {
+		atomic.StoreUint64(&s.sr.limit[idx], l)
 	}
 }
 
 func (s Spec) LastKernelTime() int64 {
-	return s.sr.lastKernelTime
+	return atomic.LoadInt64(&s.sr.lastKernelTime)
 }
 
 func CastSpec(data []byte) Spec {
@@ -204,17 +223,17 @@ func (s Spec) GetPriority() int {
 }
 
 func (s Spec) GetRecentKernel() int32 {
-	return s.sr.recentKernel
+	return atomic.LoadInt32(&s.sr.recentKernel)
 }
 
 func (s Spec) SetRecentKernel(v int32) {
-	s.sr.recentKernel = v
+	atomic.StoreInt32(&s.sr.recentKernel, v)
 }
 
 func (s Spec) GetUtilizationSwitch() int32 {
-	return s.sr.utilizationSwitch
+	return atomic.LoadInt32(&s.sr.utilizationSwitch)
 }
 
 func (s Spec) SetUtilizationSwitch(v int32) {
-	s.sr.utilizationSwitch = v
+	atomic.StoreInt32(&s.sr.utilizationSwitch, v)
 }
