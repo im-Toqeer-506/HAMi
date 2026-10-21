@@ -90,9 +90,10 @@ func (dev *RemoteGPUDevices) ReconcileSessionStubs(ctx context.Context) {
 		stub := &existing.Items[i]
 		node := stub.Labels[sessionStubLabel]
 		endpoint, keep := wanted[node]
-		// A stub whose endpoint moved is replaced rather than edited, since the
-		// fields that carry it cannot be changed on a running pod.
-		if keep && stubEndpoint(stub) == endpoint {
+		// A stub whose endpoint or pull credentials changed is replaced rather
+		// than edited, since the fields that carry them cannot be changed on a
+		// running pod.
+		if keep && stubEndpoint(stub) == endpoint && sessionPullSecretsMatch(stub, RemoteGPUSessionImagePullSecrets) {
 			delete(wanted, node)
 			continue
 		}
@@ -109,7 +110,7 @@ func (dev *RemoteGPUDevices) ReconcileSessionStubs(ctx context.Context) {
 	}
 
 	for node, endpoint := range wanted {
-		stub, err := sessionStub(namespace, node, endpoint, RemoteGPUSessionImage)
+		stub, err := sessionStub(namespace, node, endpoint, RemoteGPUSessionImage, RemoteGPUSessionImagePullSecrets)
 		if err != nil {
 			klog.ErrorS(err, "remotegpu: cannot build a session stub", "node", node, "endpoint", endpoint)
 			continue
@@ -142,7 +143,30 @@ func stubEndpoint(stub *corev1.Pod) string {
 	return ""
 }
 
-func sessionStub(namespace, node, endpoint, image string) (*corev1.Pod, error) {
+func sessionPullSecretsMatch(stub *corev1.Pod, names []string) bool {
+	if len(stub.Spec.ImagePullSecrets) != len(names) {
+		return false
+	}
+	for i, name := range names {
+		if stub.Spec.ImagePullSecrets[i].Name != name {
+			return false
+		}
+	}
+	return true
+}
+
+func imagePullSecretReferences(names []string) []corev1.LocalObjectReference {
+	if len(names) == 0 {
+		return nil
+	}
+	refs := make([]corev1.LocalObjectReference, len(names))
+	for i, name := range names {
+		refs[i].Name = name
+	}
+	return refs
+}
+
+func sessionStub(namespace, node, endpoint, image string, pullSecrets []string) (*corev1.Pod, error) {
 	// The stub answers on the port its server does, so the port a user
 	// forwards is the one they would have used against the server itself.
 	_, port, err := net.SplitHostPort(endpoint)
@@ -171,8 +195,9 @@ func sessionStub(namespace, node, endpoint, image string) (*corev1.Pod, error) {
 			NodeName: node,
 			// Whatever keeps other workloads off a lupine node must not keep
 			// that node's own relay off it.
-			Tolerations:   []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
-			RestartPolicy: corev1.RestartPolicyAlways,
+			Tolerations:      []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
+			RestartPolicy:    corev1.RestartPolicyAlways,
+			ImagePullSecrets: imagePullSecretReferences(pullSecrets),
 			Containers: []corev1.Container{{
 				Name:    "relay",
 				Image:   image,

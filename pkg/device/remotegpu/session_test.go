@@ -69,6 +69,7 @@ func TestReconcileSessionStubs_OnePerServer(t *testing.T) {
 	c := sessionScene(t, nodes)
 	cfg := testConfig()
 	cfg.SessionImage = "alpine/socat:test"
+	cfg.SessionImagePullSecrets = []string{"global-registry", "session-registry"}
 	dev := InitRemoteGPUDevice(cfg)
 	t.Cleanup(func() { InitRemoteGPUDevice(testConfig()) })
 
@@ -86,12 +87,57 @@ func TestReconcileSessionStubs_OnePerServer(t *testing.T) {
 	// The label's port carries through, so a user forwards the port they would
 	// have used against the server.
 	assert.Equal(t, stubEndpoint(&b), "10.0.0.6:24000")
+	assert.DeepEqual(t, a.Spec.ImagePullSecrets, []corev1.LocalObjectReference{
+		{Name: "global-registry"},
+		{Name: "session-registry"},
+	})
 	assert.Assert(t, strings.Contains(b.Spec.Containers[0].Args[0], "TCP-LISTEN:24000"))
 	assert.Equal(t, b.Spec.Containers[0].Ports[0].ContainerPort, int32(24000))
 
 	// A second pass changes nothing.
 	dev.ReconcileSessionStubs(context.Background())
 	assert.Equal(t, len(stubsIn(t, c)), 2)
+}
+
+func TestReconcileSessionStubs_ReplacesChangedPullSecrets(t *testing.T) {
+	nodes := []corev1.Node{
+		lupineNode("gpu-a", "10.0.0.5", "", []*device.DeviceInfo{gpu("GPU-1", 40000)}),
+	}
+	stale := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sessionStubPrefix + "gpu-a",
+			Namespace: "kube-system",
+			Labels:    map[string]string{sessionStubLabel: "gpu-a"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  "relay",
+				Image: "alpine/socat:test",
+				Env:   []corev1.EnvVar{{Name: sessionEndpointEnv, Value: "10.0.0.5:14833"}},
+			}},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "old-registry"}},
+		},
+	}
+	c := sessionScene(t, nodes, stale)
+	cfg := testConfig()
+	cfg.SessionImage = "alpine/socat:test"
+	cfg.SessionImagePullSecrets = []string{"global-registry", "session-registry"}
+	dev := InitRemoteGPUDevice(cfg)
+	t.Cleanup(func() { InitRemoteGPUDevice(testConfig()) })
+
+	dev.ReconcileSessionStubs(context.Background())
+	stubs := stubsIn(t, c)
+	assert.Equal(t, len(stubs), 1)
+	assert.DeepEqual(t, stubs[0].Spec.ImagePullSecrets, []corev1.LocalObjectReference{
+		{Name: "global-registry"},
+		{Name: "session-registry"},
+	})
+}
+
+func TestSessionStub_NoPullSecretsByDefault(t *testing.T) {
+	stub, err := sessionStub("kube-system", "gpu-a", "10.0.0.5:14833", "alpine/socat:test", nil)
+	assert.NilError(t, err)
+	assert.Equal(t, len(stub.Spec.ImagePullSecrets), 0)
 }
 
 // A stub outlives its usefulness the moment its server stops being one, and a
